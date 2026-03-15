@@ -1,0 +1,442 @@
+#!/usr/bin/env python3
+from concurrent import futures
+import logging
+import time
+import threading
+import grpc
+import saraswati_service_pb2
+import saraswati_service_pb2_grpc
+import argparse
+import warnings
+import json
+import shap
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from xgboost import XGBRegressor
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+from power_alignment import align_benchmark_iter_power,align_benchmark_iter_power_super
+from profiler_alignment import align_benchmark_iter_profiler,align_benchmark_iter_profiler_super
+from math import sqrt
+from tqdm import tqdm
+
+warnings.simplefilter(action='ignore', category=FutureWarning)
+
+BUCKET_SIZE_MS = 1000
+
+class SaraswatiState():
+
+    def __init__(self, probes, output_directory, target_directory, transfer, super_iteration, baseline):
+        self.applications = dict() #pid to str (app name) map
+        self.thresholds = dict() #str (app name) to target ratio
+        self.iter_bound = dict() #str (app name) to int (bound iterations) map
+        self.iter_count = dict() #pid to int (iteration count) map
+        self.application_client_locks = dict() #pid to conditional lock map
+        self.run_again = dict() #pid to bool map
+        self.arrivals_lock = threading.Lock()
+        self.arrivals_count = 0
+        self.shutdown_clients = False
+        self.app_is_running = False
+        self.transfer = transfer #Indicates if transfer or dynamic original training is desired
+        self.probes = probes #String of probes separated by ','
+        self.output_directory = output_directory #Path to top level directory
+        self.target_directory = target_directory #Path to target directory
+        self.aligned_data = pd.DataFrame()
+        self.original_model = None #The original model if performing a transfer
+        self.model = None #The model storage to eventually return
+        self.df_train = None
+        self.df_test = None
+        self.ratios = []
+        self.shap = pd.DataFrame()
+        self.shaps = []
+        self.corrs = []
+        self.corrs_err = []
+        self.target_corr = .8 #hard coded for right now
+        self.super_iteration = super_iteration
+        self.baseline = baseline
+
+    def arrivals_atomic_add(self):
+        with self.arrivals_lock:
+            self.arrivals_count += 1
+
+    def arrivals_atomic_subtract(self):
+        with self.arrivals_lock:
+            self.arrivals_count -= 1
+
+    def finished_iter(self):
+        self.app_is_running = False
+
+    def started_iter(self):
+        self.app_is_running = True
+
+    def is_running(self):
+        return self.app_is_running
+            
+    def is_shutdown(self):
+        return self.shutdown_clients
+        
+    def shutdown(self):
+        self.shutdown_clients = True
+        
+    def add_app(self, application, pid):
+        self.applications[pid] = application
+        self.application_client_locks[pid] = threading.Condition()
+        self.run_again[pid] = True
+        self.iter_count[pid] = 0
+        
+class SaraswatiServiceServicer(saraswati_service_pb2_grpc.SaraswatiServiceServicer):
+
+    def __init__(self, glob_state):
+        self.state = glob_state
+    
+    def connect(self, request, context): #Receives a ConnectionRequest
+        app_name = request.application_name
+        pid = request.pid
+        self.state.add_app(app_name, pid) #Add pid:application info to global state
+        return saraswati_service_pb2.ConnectionResponse(is_available=True) #Notify that client is connected
+
+    def start(self, request, context): #Receives a StartRequest
+        pid = request.pid
+        with self.state.application_client_locks[pid]:
+            self.state.arrivals_atomic_add()
+            #print(f"{pid}:{self.state.applications[pid]} IS WAITING")
+            self.state.application_client_locks[pid].wait() #Wait for main thread to let application run
+        self.state.arrivals_atomic_subtract()
+        run_app = not(self.state.shutdown_clients)
+        #print(f"Telling {pid}:{self.state.applications[pid]} TO RUN")
+        return saraswati_service_pb2.StartResponse(can_run=run_app) #Tell JVM to run the app
+    
+    def finished(self, request, context): #Receives a FinishedNotification
+        pid = request.pid
+        self.state.finished_iter()
+        return saraswati_service_pb2.Empty() #Let the JVM get back to a starting state
+        
+    def check_shutdown(self):
+        return self.state.is_shutdown()
+
+def get_ratio(prediction, real):
+    total_prediction_energy = prediction.sum()
+    total_actual_energy = real.sum()
+    return np.abs((total_actual_energy - total_prediction_energy) / total_actual_energy)
+
+def get_thresholds(path, band=0):
+    thresholds = pd.read_csv(path).set_index("benchmark").sum(axis=1).round(3).to_dict()
+    for b in thresholds:
+        thresholds[b] += band
+    return thresholds
+
+def get_clean_saraswati_df(saraswati_state,aligned_trace):
+    df = aligned_trace.fillna(-1)
+    df = df[df.power <= 10**5]
+    df = df[df.power > 0]
+    df["iteration"] = df.iteration - df.iteration.min()+1
+    return df
+
+def train_smaller_model_original(large_df, features):
+    print(large_df)
+    smaller_df_train = pd.DataFrame()
+    smaller_df_test = pd.DataFrame()
+    for b in large_df.benchmark.unique():
+        bench_df = large_df[large_df.benchmark == b]
+        train_data = bench_df
+        if len(train_data) < 2:
+            print(f"{b} did not have enough data for training!")
+            continue            
+        split_train, split_test = train_test_split(train_data, test_size=.2) #80/20 train/test split
+        smaller_df_train = pd.concat([smaller_df_train, split_train])
+        smaller_df_test = pd.concat([smaller_df_test, split_test])
+    events_df_train = smaller_df_train[features]
+    power_df_train = smaller_df_train["power"]
+    #print(f"events-->{events_df_train}\npower-->{power_df_train}\n")
+    transfer_model = XGBRegressor()
+    transfer_model.fit(events_df_train, power_df_train)
+    return (transfer_model, smaller_df_train.copy(), smaller_df_test.copy())
+
+def get_diff(prediction, real):    
+    return np.abs(real - prediction).mean()
+
+def dynamic_original_training(saraswati_state):
+    df = get_clean_saraswati_df(saraswati_state, saraswati_state.aligned_data).fillna(-1)
+    features = sorted([f for f in df.columns if f not in ["benchmark","ts","power", "iteration"]]) #Grabbing methods
+    #print(f"features-->{features}\n")
+    benchmarks = df.benchmark.unique()
+    model,df_train,df_test = train_smaller_model_original(df, features)
+    for bench in benchmarks:
+        events_test = df_test[df_test.benchmark == bench]
+        if len(events_test) == 0:
+            saraswati_state.ratios.append(100000) #Indicates there was not enough data to train that benchmark
+            continue
+        events_test = events_test[features]
+        #initial prediction
+        prediction_energy = model.predict(events_test)
+        real_energy = df_test[df_test.benchmark == bench]["power"]
+        ratio_val = get_ratio(prediction_energy, real_energy)
+        saraswati_state.ratios.append(ratio_val)
+    #ratio_mean = pd.DataFrame(ratios).mean()
+    #ratio_mean_df = pd.DataFrame(ratio_mean).rename(columns={0:"mean"})
+    #ratio_mean_df["std"] = pd.DataFrame(ratios).std()
+    #ratio_mean_df = ratio_mean_df.sort_index()
+    #ratio_mean_df = ratio_mean_df.reset_index(names=["benchmark"])
+    #Generate SHAP values to get method rankings
+    # print(features)
+    # print(len(features))
+    # print(model.feature_names_in_)
+    # print(len(model.feature_names_in_))
+    explainer = shap.explainers.TreeExplainer(model, df_train[features])
+    shap_values = explainer(df_train[features])
+    print("shap done explaining")
+    big_df = pd.DataFrame()
+    for i in tqdm(range(len(shap_values.values))):
+        big_df = pd.concat([big_df, pd.DataFrame(shap_values.values[i], index = df_train[features].columns).rename({0:"power"}, axis=1)])
+    shap_df = big_df.reset_index().rename({"index":"function"}, axis=1)
+    saraswati_state.shaps.append(shap_df) #For shap dump
+    if len(saraswati_state.shap) == 0:
+        saraswati_state.shap = shap_df.groupby("function").apply(lambda df: df.abs().mean())
+    else:
+        old_shap = saraswati_state.shap
+        old_shap = old_shap.sort_values("power").reset_index().reset_index().rename(columns={"index":"rank"})[["rank","function"]].set_index("function")
+        new_shap = shap_df.groupby("function").apply(lambda df: df.abs().mean())
+        new_shap = new_shap.sort_values("power").reset_index().reset_index().rename(columns={"index":"rank"})[["rank","function"]].set_index("function")
+        corr_temp = old_shap.corrwith(new_shap,method="spearman").iloc[0]
+        corr_temp = 0 if np.isnan(corr_temp) else corr_temp
+        saraswati_state.corrs.append(corr_temp)
+        saraswati_state.shap = shap_df.groupby("function").apply(lambda df: df.abs().mean())
+        print(f"\ncorr is {saraswati_state.corrs[-1]} (std: {np.array(saraswati_state.corrs[-10:]).std()})\n")
+    #Set the state to the most recent training run
+    saraswati_state.model = model
+    saraswati_state.df_train = df_train
+    saraswati_state.df_test = df_test
+    #saraswati_state.ratios = ratio_mean_df
+    return
+
+def dump(saraswati_state):
+    #num_loops += 1
+    #end = time.time()
+    #training_duration = end - start
+    # data_duration = 0
+    # for s in sizes:
+    #     data_duration += len(df[(df.benchmark == s) & (df.iteration <= sizes[s])])
+    # with open (f"../data/originals/times/dynamic-{machine}{config}.csv", "w") as fp:
+    #     fp.write("model,collection,training\n")
+    #     fp.write(f"dynamic-{machine},{data_duration},{training_duration:.0f}\n")
+    # diff_mean = pd.DataFrame(diffs).mean()
+    # diff_mean_df = pd.DataFrame(diff_mean).rename(columns={0:"mean"})
+    # diff_mean_df["std"] = pd.DataFrame(diffs).std()
+    # diff_mean_df = diff_mean_df.sort_index()
+    # diff_mean_df = diff_mean_df.reset_index(names=["benchmark"])
+    # diff_mean_df.to_csv(f"../data/originals/predictions/{machine}{config}.csv", index=False)
+    for i,s in enumerate(saraswati_state.shaps):
+        s.to_csv(f"{saraswati_state.output_directory}/{i}_SHAP_values.csv")
+    formatted_counts = dict()
+    for pid in saraswati_state.iter_count:
+        formatted_counts[saraswati_state.applications[pid]] = saraswati_state.iter_count[pid]
+    with open(f"{saraswati_state.output_directory}/sizes.json", "w") as fp:
+        json.dump(formatted_counts, fp)
+    with open(f"{saraswati_state.output_directory}/ratios.csv", "w") as fp:
+        fp.write("iteration,ratio\n")
+        for i in range(len(saraswati_state.ratios)):
+            fp.write(f"{i+5},{saraswati_state.ratios[i]}\n")
+    with open(f"{saraswati_state.output_directory}/corrs.csv", "w") as fp:
+        fp.write("iteration,corr,err\n")
+        for i in range(len(saraswati_state.corrs)):
+            fp.write(f"{i+6},{saraswati_state.corrs[i]},{saraswati_state.corrs_err[i]}\n")
+    saraswati_state.model.save_model(f"{saraswati_state.output_directory}/model.json")
+    saraswati_state.df_train.to_csv(f"{saraswati_state.output_directory}/training.csv", index=False)
+    saraswati_state.df_test.to_csv(f"{saraswati_state.output_directory}/testing.csv", index=False)
+
+    
+def run_iters(saraswati_state):
+    while(saraswati_state.arrivals_count != len(saraswati_state.applications)):
+        #Stall until all of the clients are waiting
+        time.sleep(1)
+    for pid in saraswati_state.applications:
+        pid_client_lock = saraswati_state.application_client_locks[pid] #Grab lock for application
+        saraswati_state.started_iter() #Started iteration
+        if(not(saraswati_state.is_shutdown())):
+            if saraswati_state.run_again[pid]:
+                with pid_client_lock:
+                    print(f"NOTIFYING {pid}:{saraswati_state.applications[pid]}")
+                    pid_client_lock.notify()
+                while(saraswati_state.is_running()):
+                    time.sleep(1) #put a wait?
+                saraswati_state.iter_count[pid] += 1
+        else:
+            with pid_client_lock:
+                print(f"(SHUTDOWN) NOTIFYING {pid}:{saraswati_state.applications[pid]}")
+                pid_client_lock.notify()
+            while(saraswati_state.is_running()):
+                time.sleep(1)            
+        
+def shutdown(saraswati_state):
+    print("SHUTTING DOWN APPS")
+    while(saraswati_state.arrivals_count != len(saraswati_state.applications)):
+        #Stall until all of the clients are waiting
+        time.sleep(1)
+    saraswati_state.shutdown() #Set the shutdown flag
+    #Wake up threads to shutdown
+    run_iters(saraswati_state)
+
+def spearman_err(saraswati_state):
+    n = len(saraswati_state.df_train.columns) - 4 #4 is for power, iteration, benchmark, ts
+    r = saraswati_state.target_corr
+    if n <= 2:
+        return -100
+    return sqrt((1-r**2)/(n-2))
+
+def check_loop(saraswati_state):
+    ratios = None    
+    dynamic_original_training(saraswati_state)
+    ratios = saraswati_state.ratios
+    for pid in saraswati_state.run_again:
+        b = saraswati_state.applications[pid]
+        checking_accuracy = (not(saraswati_state.super_iteration) and saraswati_state.iter_count[pid] <= 50) or (saraswati_state.super_iteration and saraswati_state.iter_count[pid] <= 500)
+        target_accuracy_missed = (saraswati_state.corrs == [] or saraswati_state.corrs[-1]+spearman_err(saraswati_state) <= saraswati_state.target_corr or saraswati_state.ratios[-1] > .105)
+        checking_stability = not(checking_accuracy)
+        #target_stability_missed = np.array(saraswati_state.corrs[-10:]).std() > .05
+        target_stability_missed = (abs(saraswati_state.ratios[-1] - saraswati_state.ratios[-2]) > .05) if len(saraswati_state.ratios) > 1 else True
+        if saraswati_state.corrs != []:
+            print(f"corr + err: {saraswati_state.corrs[-1]+spearman_err(saraswati_state)}")
+            saraswati_state.corrs_err.append(spearman_err(saraswati_state))
+        if (checking_accuracy and target_accuracy_missed) or (checking_stability and target_stability_missed): #or (saraswati_state.iter_count[pid] < 1000): #Added last check for corr/ratio graphs---should remove after
+            saraswati_state.run_again[pid] = True
+        else:
+            saraswati_state.run_again[pid] = False
+    return any([saraswati_state.run_again[k] for k in saraswati_state.run_again])
+
+def align(saraswati_state):
+    for pid in saraswati_state.run_again:
+        if saraswati_state.run_again[pid]:
+            try:
+                if saraswati_state.super_iteration:
+                    align_df_power = align_benchmark_iter_power_super(saraswati_state.output_directory, saraswati_state.applications[pid], saraswati_state.iter_count[pid]-49, saraswati_state.iter_count[pid], warm_up=0, bucket=BUCKET_SIZE_MS)
+                    if not(saraswati_state.baseline):
+                        profiles_cnt = align_benchmark_iter_profiler_super(saraswati_state.output_directory, saraswati_state.applications[pid], saraswati_state.iter_count[pid]-49, saraswati_state.iter_count[pid], warm_up=0, bucket=BUCKET_SIZE_MS)
+                else:
+                #If we an an iteration we must align that data and store it in memory, i.e. append it to our df
+                    align_df_power = align_benchmark_iter_power(saraswati_state.output_directory, saraswati_state.applications[pid], saraswati_state.iter_count[pid], warm_up=0, bucket=BUCKET_SIZE_MS)
+                    if not(saraswati_state.baseline):
+                        profiles_cnt = align_benchmark_iter_profiler(saraswati_state.output_directory, saraswati_state.applications[pid], saraswati_state.iter_count[pid], warm_up=0, bucket=BUCKET_SIZE_MS)
+                #Join the two alignment frames
+                #print(profiles_cnt)
+                align_df_power = get_clean_saraswati_df(saraswati_state, align_df_power)
+                if saraswati_state.baseline:
+                    saraswati_state.aligned_data = pd.concat([saraswati_state.aligned_data, align_df_power])
+                    return
+                b = saraswati_state.applications[pid]
+                p_c_b = profiles_cnt[profiles_cnt.benchmark == b].dropna(axis=1, how="all").fillna(-1)
+                align_df = align_df_power[["benchmark", "ts","power", "iteration"]].fillna(-1).merge(p_c_b, on=["ts","benchmark"])
+                #align_df = align_df.rename(lambda method : method.replace("$", r"\$").replace("[", "").replace("]", "").replace("<", ""), axis=1)
+                #saraswati_state.aligned_data = pd.concat([saraswati_state.aligned_data, align_df.reset_index()])
+                #print(align_df)
+                saraswati_state.aligned_data = pd.concat([saraswati_state.aligned_data, align_df])
+            except Exception as e:
+                #Suppress the exception for now
+                print(f"{e}: Could not align most recent run!")
+                return
+
+def baseline_loop(saraswati_state):
+    while saraswati_state.arrivals_count < 1: #Wait until the connection is made
+        time.sleep(1)
+    #Running a baseline, so no adaptive model building needed
+    iters_to_run = 500 if saraswati_state.super_iteration else 50
+    for i in range(iters_to_run):
+        run_iters(saraswati_state)
+        align(saraswati_state)
+    shutdown(saraswati_state)
+            
+def saraswati_loop(saraswati_state):
+    while saraswati_state.arrivals_count < 1: #Wait until the connection is made
+        time.sleep(1)
+    #Each app should be run at least 100 times
+    for i in range(100):
+        run_iters(saraswati_state)
+        align(saraswati_state)
+    while check_loop(saraswati_state):
+        for i in range(10): #"A" variable in algo spec
+            run_iters(saraswati_state)
+            align(saraswati_state)
+    shutdown(saraswati_state)
+
+def saraswati_loop_super(saraswati_state):
+    while saraswati_state.arrivals_count < 1: #Wait until the connection is made
+        time.sleep(1)
+    #Each app should be run at least five times
+    for i in range(100):
+        run_iters(saraswati_state)
+    align(saraswati_state)
+    while check_loop(saraswati_state):
+        for i in range(50): #super iterations run 50 times before alignment 
+            run_iters(saraswati_state)
+        align(saraswati_state)
+    shutdown(saraswati_state)
+
+    
+def parse_args():
+    parser = argparse.ArgumentParser(description='saraswati server')
+    parser.add_argument(
+        '-t',
+        '--transfer',
+        default=False,
+        action="store_true",
+        help="Flag for performing transfer (default is dynamic original training)"
+    )
+    parser.add_argument(
+        '--target',
+        default=None,
+        type=str,
+        help="path to target data"
+    )
+    parser.add_argument(
+        '--probes',
+        default='monitor__wait',
+        type=str,
+        help='jvm probes to trace'
+    )
+    parser.add_argument(
+        '--output_directory',
+        default='.',
+        type=str,
+        help='top level directory containing experiment folders'
+    )
+    parser.add_argument(
+        '-s',
+        '--super_iteration',
+        default=False,
+        action="store_true",
+        help="Flag for enabling super iterations (default is off)"
+    )
+    parser.add_argument(
+        '-b',
+        '--baseline',
+        default=False,
+        action="store_true",
+        help="Flag for disabling profiler for getting baseline energy (default is off)"
+    )
+    return parser.parse_args()
+
+    
+def main():
+    args = parse_args()
+    state = SaraswatiState(args.probes, args.output_directory, args.target, args.transfer, args.super_iteration, args.baseline)
+    server = grpc.server(futures.ThreadPoolExecutor()) #Not setting max_workers
+    saraswati_service_pb2_grpc.add_SaraswatiServiceServicer_to_server(
+        SaraswatiServiceServicer(state), server
+    )
+    server.add_insecure_port("[::]:50051")
+    server.start()
+    print("Started up Saraswati server")
+    if state.baseline:
+        baseline_loop(state)
+    else:
+        if not(state.super_iteration):
+            saraswati_loop(state)
+        else:
+            saraswati_loop_super(state)
+    print("ALL APPS DISCONNECTED")
+    if not(state.baseline):
+        dump(state)
+    server.stop(5)    
+
+if __name__ == "__main__":
+    main()

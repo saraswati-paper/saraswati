@@ -1,0 +1,13 @@
+{
+    "server": {,
+	      "super_iteration": "Y"},
+    "client":
+    [
+	{
+	    "suite": "renaissance",
+	    "benchmark": "scala-kmeans",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

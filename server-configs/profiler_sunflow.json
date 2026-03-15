@@ -1,0 +1,13 @@
+{
+    "server": {},
+    "client":
+    [
+	{
+	    "suite": "dacapo",
+	    "benchmark": "sunflow",
+	    "size": "default",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

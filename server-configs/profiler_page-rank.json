@@ -1,0 +1,12 @@
+{
+    "server": {},
+    "client":
+    [
+	{
+	    "suite": "renaissance",
+	    "benchmark": "page-rank",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

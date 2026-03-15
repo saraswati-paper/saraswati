@@ -1,0 +1,12 @@
+{
+    "server": {},
+    "client":
+    [
+	{
+	    "suite": "renaissance",
+	    "benchmark": "finagle-http",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

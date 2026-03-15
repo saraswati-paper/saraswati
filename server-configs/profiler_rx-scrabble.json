@@ -1,0 +1,13 @@
+{
+    "server": {,
+	       "super_iteration": "Y"},
+    "client":
+    [
+	{
+	    "suite": "renaissance",
+	    "benchmark": "rx-scrabble",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

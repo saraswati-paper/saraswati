@@ -1,0 +1,14 @@
+{
+    "server": {	   
+	      },
+    "client":
+    [
+	{
+	    "suite": "custom",
+	    "benchmark": "my-fibonacci",
+	    "main_class": "saraswati.MyFibonacci",
+	    "args": "42 {iters}"
+	}
+    ]
+    
+}

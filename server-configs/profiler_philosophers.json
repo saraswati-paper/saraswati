@@ -1,0 +1,12 @@
+{
+    "server": {},
+    "client":
+    [
+	{
+	    "suite": "renaissance",
+	    "benchmark": "philosophers",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

@@ -1,0 +1,12 @@
+{
+    "server": {},
+    "client":
+    [
+	{
+	    "suite": "renaissance",
+	    "benchmark": "future-genetic",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

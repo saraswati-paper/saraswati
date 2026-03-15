@@ -1,0 +1,12 @@
+{
+    "server": {},
+    "client":
+    [
+	{
+	    "suite": "renaissance",
+	    "benchmark": "scala-doku",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

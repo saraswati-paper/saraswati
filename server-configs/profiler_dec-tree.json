@@ -1,0 +1,12 @@
+{
+    "server": {},
+    "client":
+    [
+	{
+	    "suite": "renaissance",
+	    "benchmark": "dec-tree",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

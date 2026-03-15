@@ -1,0 +1,12 @@
+{
+    "server": {},
+    "client":
+    [
+	{
+	    "suite": "renaissance",
+	    "benchmark": "naive-bayes",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

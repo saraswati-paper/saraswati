@@ -1,0 +1,14 @@
+{
+    "server": {,
+	      "super_iteration": "Y"},
+    "client":
+    [
+	{
+	    "suite": "dacapo",
+	    "benchmark": "lusearch",
+	    "size": "default",
+	    "profiler_rate": 25
+	}
+    ]
+    
+}

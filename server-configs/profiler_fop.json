@@ -1,0 +1,13 @@
+{
+    "server": {},
+    "client":
+    [
+	{
+	    "suite": "dacapo",
+	    "benchmark": "fop",
+	    "size": "default",
+	    "profiler_rate":"15"
+	}
+    ]
+    
+}
