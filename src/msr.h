@@ -135,3 +135,4 @@ void get_rapl_parameters(int fd, uint64_t msr_addr, rapl_msr_unit *unit_obj, rap
 void getPowerSpec(double result[4], rapl_msr_parameter *parameter, int domain);
 
 #endif
+

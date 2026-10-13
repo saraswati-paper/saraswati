@@ -113,3 +113,4 @@ int getSocketNum() {
 	//printf("num_pkg_thread: %d, num_core_thread: %d, coreNum: %d, num_pkg: %d\n", num_pkg_thread, num_core_thread, coreNum, num_pkg);
 //	return num_pkg;
 }
+

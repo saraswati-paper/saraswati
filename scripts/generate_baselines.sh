@@ -2,3 +2,4 @@ elems="akka-uct gauss-mix philosophers als  graphchi pmd avrora  h2  reactors ba
 for bench in $elems; do
     python3 $PWD/scripts/generate_experiments.py --exp_path=./data/baseline/$bench/ --java_path=$PWD/jdk/bin/java --python_path=$PWD/venv/bin/python --server_config=$PWD/server-configs/profiler_$bench.json --baseline
 done
+

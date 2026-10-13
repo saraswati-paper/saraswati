@@ -17,3 +17,4 @@ java_binary(
     runtime_deps = ["@grpc-java//netty"],
     deps = ["//:benchmarks","//src/main/proto/saraswati:saraswati_service_java_protos", "@grpc-java//api", "//src/main/proto/saraswati:saraswati_service_java_grpc"],
 )
+

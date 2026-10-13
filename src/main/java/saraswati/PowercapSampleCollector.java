@@ -281,3 +281,4 @@ public final class PowercapSampleCollector implements SampleCollector{
     return energy;
   }
 }
+

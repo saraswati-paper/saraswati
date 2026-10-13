@@ -46,3 +46,4 @@ get_java_deps:
 	mv download lib/dacapo.jar
 	wget https://github.com/renaissance-benchmarks/renaissance/releases/download/v0.14.1/renaissance-gpl-0.14.1.jar
 	mv renaissance-gpl-0.14.1.jar lib/renaissance-gpl-0.14.1.jar
+

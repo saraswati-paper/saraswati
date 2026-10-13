@@ -5,3 +5,4 @@ public interface SampleCollector{
     public void write_iter();
     public void dump();    
 }
+

@@ -278,3 +278,4 @@ public final class RaplSampleCollector implements SampleCollector{
     return energy;
   }
 }
+

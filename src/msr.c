@@ -283,3 +283,4 @@ getPowerSpec(double result[4], rapl_msr_parameter *parameter, int domain) {
 		result[3] = parameters[domain].max_time_window;
 	}
 }
+

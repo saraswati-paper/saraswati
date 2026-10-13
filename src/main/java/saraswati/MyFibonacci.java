@@ -50,3 +50,4 @@ final class MyFibonacci {
 	collector.dump();
     }
 }
+

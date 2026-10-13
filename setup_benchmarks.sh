@@ -14,3 +14,4 @@ if [ ! -f "${LIBRARY_PATH}/renaissance-gpl-0.14.1.jar" ]; then
   wget https://github.com/renaissance-benchmarks/renaissance/releases/download/v0.14.1/renaissance-gpl-0.14.1.jar
   mv renaissance-gpl-0.14.1.jar lib/renaissance-gpl-0.14.1.jar
 fi
+
